@@ -6,6 +6,7 @@ from torch.utils.data import Dataset
 # 通过时间戳（时间索引）从全量时间序列中提取每个时间窗口输入数据
 import torch
 from torch.utils.data import Dataset
+from torch.nn.utils.rnn import pad_sequence
 import pandas as pd
 import numpy as np
 
@@ -151,7 +152,10 @@ class TimeSeriesDataset(Dataset):
             full_time_series_data, window_end_time  # 固定开始时间为0
             )
 
-        # 4. 转换为 PyTorch Tensor
+        # 4. 获取序列实际长度
+        seq_length = processed_window_data.shape[0]
+
+        # 5. 转换为 PyTorch Tensor
         window_tensor = torch.from_numpy(processed_window_data)
 
         # 5. 获取标签
@@ -168,7 +172,7 @@ class TimeSeriesDataset(Dataset):
 
         # 7. 返回数据和标签
         # return (window_tensor, mask_tensor, seq_len_tensor), targets # 如果返回多个
-        return window_tensor, targets
+        return window_tensor, targets, seq_length
 
 
 def collate_fn(batch):
@@ -182,22 +186,45 @@ def collate_fn(batch):
     # 分离数据和标签
     data_list, targets_list = zip(*batch)
 
-    # 获取batch中序列的最大长度
-    max_seq_len = max([data.shape[0] for data in data_list])
-    feature_dim = data_list[0].shape[1]
-    batch_size = len(data_list)
+    # 获取batch中序列的实际长度
+    seq_lengths = torch.tensor([data.shape[0] for data in data_list], dtype=torch.long)
 
-    # 创建补齐后的数据张量
-    padded_data = torch.zeros((batch_size, max_seq_len, feature_dim), dtype=torch.float32)
+    # # 获取batch中序列的最大长度
+    # max_seq_len = max([data.shape[0] for data in data_list])
+    # feature_dim = data_list[0].shape[1]
+    # batch_size = len(data_list)
+    #
+    # # 创建补齐后的数据张量
+    # padded_data = torch.zeros((batch_size, max_seq_len, feature_dim), dtype=torch.float32)
+    #
+    # # 对每个序列进行补齐（在序列开头补齐）
+    # for i, data in enumerate(data_list):
+    #     seq_len = data.shape[0]
+    #     padded_data[i, :seq_len, :] = data  # 在开头对齐，末尾补齐
 
-    # 对每个序列进行补齐（在序列开头补齐）
-    for i, data in enumerate(data_list):
-        seq_len = data.shape[0]
-        padded_data[i, -seq_len:, :] = torch.from_numpy(data)  # 在末尾对齐
+    # 3. 使用 pad_sequence 进行补齐 (更高效)
+    # pad_sequence 默认在序列开头填充以对齐到最长序列
+    # batch_first=True 使得输出形状为 (batch_size, max_seq_len, feature_dim)
+    # 注意：pad_sequence 期望列表中的张量是 (seq_len, feature_dim)
+    padded_data = pad_sequence(data_list, batch_first=True, padding_value=0)
+
+    # 4. 生成 Attention Mask (用于 Transformer)
+    # 创建一个与 padded_data 序列长度相同的索引张量
+    batch_size, max_seq_len, _ = padded_data.shape
+    # indices shape: (max_seq_len,)
+    indices = torch.arange(max_seq_len)
+    # indices.unsqueeze(0) shape: (1, max_seq_len)
+    # seq_lengths.unsqueeze(1) shape: (batch_size, 1)
+    # 广播比较，得到 mask shape: (batch_size, max_seq_len)
+    # 对于每个样本 i，在时间步 j，如果 j < seq_lengths[i] 则为 True (有效)，否则为 False (padding)
+    attention_mask = indices.unsqueeze(0) < seq_lengths.unsqueeze(1)
+    # 注意：PyTorch Transformer 的 src_key_padding_mask 参数通常期望
+    # False 表示需要被 mask (即 padding 位置)，True 表示有效。
+    # 因此 attention_mask 的定义是符合要求的。
 
     # 合并标签
     targets_dict = {}
     for key in targets_list[0].keys():
         targets_dict[key] = torch.stack([targets[key] for targets in targets_list])
 
-    return padded_data, targets_dict
+    return padded_data, targets_dict, seq_lengths, attention_mask
